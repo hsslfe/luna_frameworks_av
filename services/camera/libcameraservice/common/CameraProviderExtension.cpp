@@ -37,3 +37,14 @@ __attribute__((weak)) int32_t getTorchStrengthLevelExt() {
 __attribute__((weak)) void setTorchStrengthLevelExt(__unused int32_t torchStrength, __unused bool enabled) {
     // Nothing
 }
+
+__attribute__((weak)) bool supportsTorchStrengthControlForCameraExt(
+        __unused const char* cameraId) {
+    return supportsTorchStrengthControlExt();
+}
+
+__attribute__((weak)) int32_t setTorchStrengthLevelCheckedExt(
+        int32_t torchStrength, bool enabled) {
+    setTorchStrengthLevelExt(torchStrength, enabled);
+    return 0;
+}

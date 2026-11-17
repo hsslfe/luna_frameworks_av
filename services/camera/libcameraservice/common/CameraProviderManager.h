@@ -17,6 +17,7 @@
 #ifndef ANDROID_SERVERS_CAMERA_CAMERAPROVIDER_H
 #define ANDROID_SERVERS_CAMERA_CAMERAPROVIDER_H
 
+#include <atomic>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -636,7 +637,8 @@ private:
             wp<ProviderInfo> mParentProvider;
             // Torch strength default, maximum levels if the torch strength control
             // feature is supported.
-            int32_t mTorchStrengthLevel;
+            // Provider status callbacks can reset this outside mInterfaceMutex.
+            std::atomic<int32_t> mTorchStrengthLevel;
             int32_t mTorchMaximumStrengthLevel;
             int32_t mTorchDefaultStrengthLevel;
 
@@ -905,6 +907,9 @@ private:
     template <class ProviderInfoType, class HalCameraProviderType>
     status_t setTorchModeT(sp<ProviderInfo> &parentProvider,
             std::shared_ptr<HalCameraProvider> *halCameraProvider);
+
+    // Requires mInterfaceMutex. A zero strength selects the default level.
+    status_t setTorchModeLocked(const std::string &id, bool enabled, int32_t strength);
 
     // Try to get hidl provider services declared. Expects mInterfaceMutex to be
     // locked. Also registers for hidl provider service notifications.

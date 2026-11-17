@@ -21,3 +21,8 @@ extern int32_t getTorchDefaultStrengthLevelExt();
 extern int32_t getTorchMaxStrengthLevelExt();
 extern int32_t getTorchStrengthLevelExt();
 extern void setTorchStrengthLevelExt(int32_t torchStrength, bool enabled);
+
+// Defaults preserve existing device extensions. New extensions can scope support
+// to one camera and return a negative errno when a hardware operation fails.
+extern bool supportsTorchStrengthControlForCameraExt(const char* cameraId);
+extern int32_t setTorchStrengthLevelCheckedExt(int32_t torchStrength, bool enabled);

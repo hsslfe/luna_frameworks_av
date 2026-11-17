@@ -585,6 +585,7 @@ status_t CameraProviderManager::getHighestSupportedVersion(const std::string &id
 
 status_t CameraProviderManager::getTorchStrengthLevel(const std::string &id,
         int32_t* torchStrength /*out*/) {
+    if (torchStrength == nullptr) return BAD_VALUE;
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
 
     auto deviceInfo = findDeviceInfoLocked(id);
@@ -592,8 +593,10 @@ status_t CameraProviderManager::getTorchStrengthLevel(const std::string &id,
 
     // Use the extension only for the camera that has flash unit
     // Otherwise fallback to the default impl.
-    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlExt()) {
+    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlForCameraExt(id.c_str())) {
         int32_t strength = getTorchStrengthLevelExt();
+        if (strength < 0) return strength;
+        if (strength < 1 || strength > getTorchMaxStrengthLevelExt()) return INVALID_OPERATION;
         *torchStrength = strength;
         return OK;
     } else {
@@ -610,7 +613,7 @@ status_t CameraProviderManager::turnOnTorchWithStrengthLevel(const std::string &
 
     // Use the extension only for the camera that has flash unit
     // Otherwise fallback to the default impl.
-    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlExt()) {
+    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlForCameraExt(id.c_str())) {
         // Return BAD_VALUE if the strength is not in the supported
         // range.
         if (torchStrength <= 0 || torchStrength > getTorchMaxStrengthLevelExt()) {
@@ -618,10 +621,8 @@ status_t CameraProviderManager::turnOnTorchWithStrengthLevel(const std::string &
             return BAD_VALUE;
         }
 
-        deviceInfo->setTorchMode(torchStrength > 0);
-        setTorchStrengthLevelExt(torchStrength, true);
-        deviceInfo->mTorchStrengthLevel = torchStrength;
-        return OK;
+        // Use the same provider lifetime and error handling as setTorchMode.
+        return setTorchModeLocked(id, true, torchStrength);
     } else {
         return deviceInfo->turnOnTorchWithStrengthLevel(torchStrength);
     }
@@ -632,11 +633,12 @@ bool CameraProviderManager::shouldSkipTorchStrengthUpdate(const std::string &id,
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
 
     auto deviceInfo = findDeviceInfoLocked(id);
-    if (deviceInfo == nullptr) return NAME_NOT_FOUND;
+    if (deviceInfo == nullptr) return false;
 
-    if (deviceInfo->mTorchStrengthLevel == torchStrength) {
+    const int32_t previousStrength = deviceInfo->mTorchStrengthLevel.load();
+    if (previousStrength == torchStrength) {
         ALOGV("%s: Skipping torch strength level updates prev_level: %d, new_level: %d",
-                __FUNCTION__, deviceInfo->mTorchStrengthLevel, torchStrength);
+                __FUNCTION__, previousStrength, torchStrength);
         return true;
     }
     return false;
@@ -650,7 +652,7 @@ int32_t CameraProviderManager::getTorchDefaultStrengthLevel(const std::string &i
 
     // Use the extension only for the camera that has flash unit
     // Otherwise fallback to the default impl.
-    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlExt()) {
+    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlForCameraExt(id.c_str())) {
         return getTorchDefaultStrengthLevelExt();
     } else {
         return deviceInfo->mTorchDefaultStrengthLevel;
@@ -687,7 +689,11 @@ status_t CameraProviderManager::setTorchModeT(sp<ProviderInfo> &parentProvider,
 
 status_t CameraProviderManager::setTorchMode(const std::string &id, bool enabled) {
     std::lock_guard<std::mutex> lock(mInterfaceMutex);
+    return setTorchModeLocked(id, enabled, 0);
+}
 
+status_t CameraProviderManager::setTorchModeLocked(const std::string &id, bool enabled,
+        int32_t strength) {
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo == nullptr) return NAME_NOT_FOUND;
 
@@ -718,12 +724,34 @@ status_t CameraProviderManager::setTorchMode(const std::string &id, bool enabled
     }
     saveRef(DeviceMode::TORCH, deviceInfo->mId, halCameraProvider);
 
+    const bool useExtension = deviceInfo->hasFlashUnit() &&
+            (strength > 0 || supportsTorchStrengthControlForCameraExt(id.c_str()));
+    const int32_t previousStrength = deviceInfo->mTorchStrengthLevel;
     res = deviceInfo->setTorchMode(enabled);
-    if (deviceInfo->hasFlashUnit() && supportsTorchStrengthControlExt()) {
-        // Need to reset torch strength back to default when torch is turned off
-        int32_t defaultLevel = getTorchDefaultStrengthLevelExt();
-        setTorchStrengthLevelExt(defaultLevel, enabled);
-        deviceInfo->mTorchStrengthLevel = defaultLevel;
+    if (res != OK) {
+        if (useExtension && previousStrength == 0) removeRef(DeviceMode::TORCH, id);
+        return res;
+    }
+    if (useExtension) {
+        int32_t level = strength > 0 ? strength :
+                (enabled && previousStrength > 0 ? previousStrength : getTorchDefaultStrengthLevelExt());
+        res = setTorchStrengthLevelCheckedExt(level, enabled);
+        if (res != OK) {
+            // Do not leave an unexpectedly bright torch on after a failed write.
+            status_t offResult = OK;
+            if (enabled) {
+                offResult = deviceInfo->setTorchMode(false);
+                if (offResult != OK) {
+                    ALOGE("%s: Failed to turn off torch after strength error: %d",
+                            __FUNCTION__, offResult);
+                }
+            }
+            deviceInfo->mTorchStrengthLevel = 0;
+            if (offResult == OK) removeRef(DeviceMode::TORCH, id);
+            return res;
+        }
+        // Zero means off, so the next turn-on also sends a strength callback.
+        deviceInfo->mTorchStrengthLevel = enabled ? level : 0;
     }
     return res;
 }
@@ -1781,9 +1809,11 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::addDynamicDepthTags(
 status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTags() {
     status_t res = OK;
     auto& c = mCameraCharacteristics;
+    const bool useExtension = hasFlashUnit() &&
+            supportsTorchStrengthControlForCameraExt(mId.c_str());
     auto flashInfoStrengthDefaultLevelEntry = c.find(ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL);
-    if (flashInfoStrengthDefaultLevelEntry.count == 0 || supportsTorchStrengthControlExt()) {
-        int32_t flashInfoStrengthDefaultLevel = getTorchDefaultStrengthLevelExt();
+    if (flashInfoStrengthDefaultLevelEntry.count == 0 || useExtension) {
+        int32_t flashInfoStrengthDefaultLevel = useExtension ? getTorchDefaultStrengthLevelExt() : 1;
         res = c.update(ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL,
                 &flashInfoStrengthDefaultLevel, 1);
         if (res != OK) {
@@ -1793,8 +1823,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTag
         }
     }
     auto flashInfoStrengthMaximumLevelEntry = c.find(ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL);
-    if (flashInfoStrengthMaximumLevelEntry.count == 0 || supportsTorchStrengthControlExt()) {
-        int32_t flashInfoStrengthMaximumLevel = getTorchMaxStrengthLevelExt();
+    if (flashInfoStrengthMaximumLevelEntry.count == 0 || useExtension) {
+        int32_t flashInfoStrengthMaximumLevel = useExtension ? getTorchMaxStrengthLevelExt() : 1;
         res = c.update(ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL,
                 &flashInfoStrengthMaximumLevel, 1);
         if (res != OK) {
@@ -1803,7 +1833,17 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTag
             return res;
         }
     }
-    return res;
+    // CameraCharacteristics.getKeys() must include the synthesized tags too.
+    auto keysEntry = c.find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+    std::vector<int32_t> keys;
+    if (keysEntry.count > 0) {
+        keys.assign(keysEntry.data.i32, keysEntry.data.i32 + keysEntry.count);
+    }
+    for (int32_t tag : {ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL,
+            ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL}) {
+        if (std::find(keys.begin(), keys.end(), tag) == keys.end()) keys.push_back(tag);
+    }
+    return c.update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, keys.data(), keys.size());
 }
 
 
@@ -3101,6 +3141,9 @@ void CameraProviderManager::ProviderInfo::torchModeStatusChangeInternal(
                 known = true;
                 systemCameraKind = deviceInfo->mSystemCameraKind;
                 if (TorchModeStatus::AVAILABLE_ON != newStatus) {
+                    // Camera takeover, thermal shutdown and HAL off also reset
+                    // the callback cache, without reentering the HAL here.
+                    deviceInfo->mTorchStrengthLevel = 0;
                     mManager->removeRef(CameraProviderManager::DeviceMode::TORCH, id);
                 }
                 break;
